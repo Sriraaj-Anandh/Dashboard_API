@@ -36,7 +36,7 @@ def fetch_all_metrics():
     finally:
         conn.close()
 
-# Common function to build summary
+# Core summary builder
 def build_summary():
     raw_metrics = fetch_all_metrics()
 
@@ -44,6 +44,7 @@ def build_summary():
         "total_updates": 0,
         "updates_per_day": defaultdict(int),
         "updates_per_month": defaultdict(int),
+        "updates_per_weekday": defaultdict(int),
         "top_user": None,
         "top_user_count": 0,
         "total_users": 0,
@@ -58,10 +59,12 @@ def build_summary():
             ts = datetime.fromisoformat(ts)
         date = ts.date()
         month_key = ts.strftime("%Y-%m")
+        weekday = ts.strftime("%A")
 
         summary["total_updates"] += row["update_count"]
         summary["updates_per_day"][str(date)] += row["update_count"]
         summary["updates_per_month"][month_key] += row["update_count"]
+        summary["updates_per_weekday"][weekday] += row["update_count"]
 
         if row["top_user"]:
             user_counter[row["top_user"]] += row["top_user_count"]
@@ -84,16 +87,18 @@ def build_summary():
 
     return summary
 
-# Main endpoint
+
+# -------------------- API Endpoints --------------------
+
 @app.get("/metrics")
 def get_all_metrics() -> Dict:
     summary = build_summary()
     summary["updates_per_day"] = dict(summary["updates_per_day"])
     summary["updates_per_month"] = dict(summary["updates_per_month"])
+    summary["updates_per_weekday"] = dict(summary["updates_per_weekday"])
     summary["table_wise_metrics"] = dict(summary["table_wise_metrics"])
     return summary
 
-# New individual endpoints
 @app.get("/metrics/top-user")
 def get_top_user():
     summary = build_summary()
@@ -118,3 +123,18 @@ def get_updates_per_month():
 def get_total_users():
     summary = build_summary()
     return {"total_users": summary["total_users"]}
+
+@app.get("/metrics/per-day")
+def get_metrics_per_day():
+    summary = build_summary()
+    return {"per_day": summary["updates_per_day"]}
+
+@app.get("/metrics/per-month")
+def get_metrics_per_month():
+    summary = build_summary()
+    return {"per_month": summary["updates_per_month"]}
+
+@app.get("/metrics/per-weekday")
+def get_metrics_per_weekday():
+    summary = build_summary()
+    return {"per_weekday": summary["updates_per_weekday"]}
