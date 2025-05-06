@@ -1,158 +1,187 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from collections import defaultdict
-from typing import Dict
-from datetime import datetime
-import pymysql
 import os
+import logging
 from dotenv import load_dotenv
+from fastapi import FastAPI
+import pymysql
+from typing import List
 
+# Load environment variables
 load_dotenv()
+
+# Logging
+logging.basicConfig(level=logging.DEBUG)
+
+# MySQL configuration
+MYSQL_USER = os.getenv("MYSQL_USER")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
+MYSQL_HOST = os.getenv("MYSQL_HOST")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
+
+# Use DictCursor for dictionary-style rows
+CLOUD_MYSQL_CONFIG = {
+    "host": MYSQL_HOST,
+    "user": MYSQL_USER,
+    "password": MYSQL_PASSWORD,
+    "database": MYSQL_DATABASE,
+    "port": MYSQL_PORT,
+    "cursorclass": pymysql.cursors.DictCursor
+}
 
 app = FastAPI()
 
-# Allow CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Cloud MySQL config
-CLOUD_MYSQL_CONFIG = {
-    'host': os.getenv('CLOUD_DB_HOST'),
-    'user': os.getenv('CLOUD_DB_USER'),
-    'password': os.getenv('CLOUD_DB_PASSWORD'),
-    'database': os.getenv('CLOUD_DB_NAME'),
-    'cursorclass': pymysql.cursors.DictCursor
-}
-
-def fetch_metrics_for_project(project_name: str):
+# Utility function to get table_name from projects table
+def get_metrics_table(project_id: int) -> str:
     conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM update_metrics WHERE project_name = %s", (project_name,))
-            return cursor.fetchall()
+            cursor.execute("SELECT table_name FROM projects WHERE project_id = %s", (project_id,))
+            result = cursor.fetchone()
+            return result["table_name"] if result else None
     finally:
         conn.close()
 
-def get_all_projects():
-    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT DISTINCT project_name FROM update_metrics")
-            return [row['project_name'] for row in cursor.fetchall()]
-    finally:
-        conn.close()
-
-def get_tables_for_project(project_name: str):
-    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT DISTINCT table_name FROM update_metrics WHERE project_name = %s", (project_name,))
-            return [row['table_name'] for row in cursor.fetchall()]
-    finally:
-        conn.close()
-
-def build_summary(metrics):
-    summary = {
-        "total_updates": 0,
-        "updates_per_day": defaultdict(int),
-        "updates_per_month": defaultdict(int),
-        "top_user": None,
-        "top_user_count": 0,
-        "total_users": 0,
-        "table_wise_metrics": defaultdict(lambda: {"count": 0, "last_updated": None})
-    }
-
-    user_counter = defaultdict(int)
-
-    for row in metrics:
-        ts = row.get("timestamp") or row.get("detected_timestamp")
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts)
-        date = ts.date()
-        month_key = ts.strftime("%Y-%m")
-
-        summary["total_updates"] += row["update_count"]
-        summary["updates_per_day"][str(date)] += row["update_count"]
-        summary["updates_per_month"][month_key] += row["update_count"]
-
-        if row["top_user"]:
-            user_counter[row["top_user"]] += row["top_user_count"]
-
-        table = row["table_name"]
-        summary["table_wise_metrics"][table]["count"] += row["update_count"]
-        last_updated = row.get("last_updated")
-        if last_updated and (
-            summary["table_wise_metrics"][table]["last_updated"] is None or
-            last_updated > summary["table_wise_metrics"][table]["last_updated"]
-        ):
-            summary["table_wise_metrics"][table]["last_updated"] = last_updated
-
-    if user_counter:
-        summary["top_user"] = max(user_counter, key=user_counter.get)
-        summary["top_user_count"] = user_counter[summary["top_user"]]
-
-    if metrics:
-        summary["total_users"] = metrics[-1]["total_users"]
-
-    return summary
-
-# --- ENDPOINTS ---
-
+# Endpoint: /projects
 @app.get("/projects")
-def list_projects():
-    return {"projects": get_all_projects()}
+async def list_projects():
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM projects")
+            projects = cursor.fetchall()
+            return {"projects": projects}
+    except Exception as e:
+        logging.error(f"Error fetching projects: {e}")
+        return {"error": "Failed to fetch projects"}
+    finally:
+        conn.close()
 
-@app.get("/projects/{project_name}/tables")
-def list_tables(project_name: str):
-    tables = get_tables_for_project(project_name)
-    if not tables:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return {"project": project_name, "tables": tables}
+# Endpoint: /metrics/{project_id}
+@app.get("/metrics/{project_id}")
+async def get_project_metrics(project_id: int):
+    table_name = get_metrics_table(project_id)
+    if not table_name:
+        return {"error": "Project not found"}
 
-@app.get("/projects/{project_name}/metrics")
-def get_project_metrics(project_name: str):
-    metrics = fetch_metrics_for_project(project_name)
-    if not metrics:
-        raise HTTPException(status_code=404, detail="Project not found")
-    summary = build_summary(metrics)
-    return {
-        **summary,
-        "updates_per_day": dict(summary["updates_per_day"]),
-        "updates_per_month": dict(summary["updates_per_month"]),
-        "table_wise_metrics": dict(summary["table_wise_metrics"])
-    }
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            query = f"SELECT * FROM `{table_name}` ORDER BY detected_timestamp DESC LIMIT 1"
+            cursor.execute(query)
+            result = cursor.fetchone()
+            return {"metrics": result} if result else {"error": "No data found"}
+    except Exception as e:
+        logging.error(f"Error fetching metrics: {e}")
+        return {"error": "Failed to fetch metrics"}
+    finally:
+        conn.close()
 
-@app.get("/projects/{project_name}/metrics/top-user")
-def get_project_top_user(project_name: str):
-    metrics = fetch_metrics_for_project(project_name)
-    summary = build_summary(metrics)
-    return {"top_user": summary["top_user"], "entry_count": summary["top_user_count"]}
+# Endpoint: /metrics/{project_id}/total-users
+@app.get("/metrics/{project_id}/total-users")
+async def get_total_users(project_id: int):
+    table_name = get_metrics_table(project_id)
+    if not table_name:
+        return {"error": "Project not found"}
 
-@app.get("/projects/{project_name}/metrics/total-updates")
-def get_project_total_updates(project_name: str):
-    metrics = fetch_metrics_for_project(project_name)
-    summary = build_summary(metrics)
-    return {"total_updates": summary["total_updates"]}
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT total_users FROM `{table_name}` ORDER BY detected_timestamp DESC LIMIT 1")
+            result = cursor.fetchone()
+            return {"total_users": result["total_users"]} if result else {"total_users": 0}
+    except Exception as e:
+        logging.error(f"Error fetching total users: {e}")
+        return {"error": "Failed to fetch total users"}
+    finally:
+        conn.close()
 
-@app.get("/projects/{project_name}/metrics/weekday")
-def get_project_weekday_metrics(project_name: str):
-    metrics = fetch_metrics_for_project(project_name)
-    summary = build_summary(metrics)
-    return summary["updates_per_day"]
+# Endpoint: /metrics/{project_id}/top-user
+@app.get("/metrics/{project_id}/top-user")
+async def get_top_user(project_id: int):
+    table_name = get_metrics_table(project_id)
+    if not table_name:
+        return {"error": "Project not found"}
 
-@app.get("/projects/{project_name}/metrics/monthly")
-def get_project_monthly_metrics(project_name: str):
-    metrics = fetch_metrics_for_project(project_name)
-    summary = build_summary(metrics)
-    return summary["updates_per_month"]
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"SELECT top_user, top_user_count FROM `{table_name}` ORDER BY detected_timestamp DESC LIMIT 1")
+            result = cursor.fetchone()
+            return {"top_user": result["top_user"], "entry_count": result["top_user_count"]} if result else {"top_user": None, "entry_count": 0}
+    except Exception as e:
+        logging.error(f"Error fetching top user: {e}")
+        return {"error": "Failed to fetch top user"}
+    finally:
+        conn.close()
 
-@app.get("/projects/{project_name}/metrics/total-users")
-def get_project_total_users(project_name: str):
-    metrics = fetch_metrics_for_project(project_name)
-    summary = build_summary(metrics)
-    return {"total_users": summary["total_users"]}
+# Endpoint: /metrics/{project_id}/entries-per-day
+@app.get("/metrics/{project_id}/entries-per-day")
+async def get_entries_per_day(project_id: int):
+    table_name = get_metrics_table(project_id)
+    if not table_name:
+        return {"error": "Project not found"}
+
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"""
+                SELECT day, SUM(update_count) AS total_updates
+                FROM `{table_name}`
+                GROUP BY day
+                ORDER BY day
+            """)
+            result = cursor.fetchall()
+            return {"entries_per_day": result}
+    except Exception as e:
+        logging.error(f"Error fetching entries per day: {e}")
+        return {"error": "Failed to fetch daily entries"}
+    finally:
+        conn.close()
+
+# Endpoint: /metrics/{project_id}/entries-per-weekday
+@app.get("/metrics/{project_id}/entries-per-weekday")
+async def get_entries_per_weekday(project_id: int):
+    table_name = get_metrics_table(project_id)
+    if not table_name:
+        return {"error": "Project not found"}
+
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"""
+                SELECT weekday, SUM(update_count) AS total_updates
+                FROM `{table_name}`
+                GROUP BY weekday
+                ORDER BY FIELD(weekday, 'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')
+            """)
+            result = cursor.fetchall()
+            return {"entries_per_weekday": result}
+    except Exception as e:
+        logging.error(f"Error fetching entries per weekday: {e}")
+        return {"error": "Failed to fetch weekday entries"}
+    finally:
+        conn.close()
+
+# Endpoint: /metrics/{project_id}/entries-per-month
+@app.get("/metrics/{project_id}/entries-per-month")
+async def get_entries_per_month(project_id: int):
+    table_name = get_metrics_table(project_id)
+    if not table_name:
+        return {"error": "Project not found"}
+
+    conn = pymysql.connect(**CLOUD_MYSQL_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(f"""
+                SELECT month, SUM(update_count) AS total_updates
+                FROM `{table_name}`
+                GROUP BY month
+                ORDER BY FIELD(month, 'January','February','March','April','May','June','July','August','September','October','November','December')
+            """)
+            result = cursor.fetchall()
+            return {"entries_per_month": result}
+    except Exception as e:
+        logging.error(f"Error fetching entries per month: {e}")
+        return {"error": "Failed to fetch monthly entries"}
+    finally:
+        conn.close()
